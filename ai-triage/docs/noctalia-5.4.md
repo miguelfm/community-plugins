@@ -1,8 +1,24 @@
 # Noctalia 5.4 integration
 
-Reviewed on 2026-10-31: AI Triage 1.8.3, plugin_api = 43, installed Noctalia 5.4.0.
+Reviewed on 2026-11-05: AI Triage 1.8.4, plugin_api = 43, installed Noctalia 5.4.0.
+Version 1.8.4 introduces Fast Boot resilience and persistent report caching.
 Version 1.8.3 adds DeepRelay and validates full compatibility against ai-usagebar 1.47.0.
 Panel geometry and runtime contract remain unchanged.
+
+Version 1.9.0 adds concise model-specific reset labels while keeping general
+resets unlabeled. See the [reset scope audit](ai_usagebar_compatibility.md#model-specific-reset-labels-in-190)
+for the November 10 review, real-panel verification and the remaining
+overall-weekly estimate limitation. The API 43 and panel geometry contract below
+remain unchanged.
+
+## Fast Boot and cold-start report persistence in 1.8.4
+
+Under Noctalia 5.4 and systemd/UWSM with parallel session launch (`-g -1`), the graphical shell and plugin service start before network/DNS connectivity (`network-online.target`) is fully resolved.
+
+Version 1.8.4 introduces:
+- **Zero-millisecond cold start via disk caching**: The service persists the latest authoritative report into `~/.local/state/noctalia/plugins/data/miguelfm/ai-triage/last-report.json`. On initialization, `service.luau` reads this file immediately to populate `noctalia.state` with `report` before the first CLI spawn.
+- **Progressive failure retry**: If `ai-usagebar usage --json` fails due to unready network/DNS (`Could not resolve host` or timeout), `scheduleFailureRetry` replaces the standard 3–5 minute polling interval with progressive backoff (8s, 16s... up to 60s). Once network connectivity is established and a refresh succeeds, the retry counter resets to zero and normal periodic polling resumes.
+- **Panel loading states and instant render**: `onOpen()` reads cached state and calls `render()` immediately before triggering a refresh request, eliminating startup latency and blank/flickering cards. When opening the panel while polling without candidates, the UI displays a clean loading status instead of falsely reporting "No providers configured or reachable."
 
 ## Panel contract
 
@@ -10,18 +26,19 @@ Panel geometry and runtime contract remain unchanged.
 | --- | --- |
 | width | 1520 |
 | height | "content" |
-| max_height | 560 |
+| max_height | 675 |
 | placement / position | attached / auto |
 | open_near_click | true |
 
-Noctalia measures content height and limits it to the declared maximum. This
-does not make the fixed width responsive. Dimensions are logical pixels; the
-physical result depends on scale and available space. The visual confirmation
-covers Miguel's machine, not every resolution, scale or a separate niri session.
+Noctalia measures content height automatically and sizes the panel to fit the
+rendered tree, capped at the declared maximum. Because the layout uses
+`height = "content"`, the panel only takes as much vertical space as the cards
+and headers require, leaving zero empty space for smaller setups while allowing
+configurations with 3–5 models and reset credit schedules under the Huge (130%)
+typography scale preset to render without triggering vertical scrollbars.
 
-The three columns retain independent scrolling for longer lists. Keep the
-accepted maximum of 560; do not restore the initial migration's 780 limit or
-remove internal scrolling merely to shrink the panel.
+The three columns retain independent native scrolling (`ui.scroll`) as a safe
+fallback for extended provider lists that exceed the 675px ceiling.
 
 ## Colors and API compatibility
 

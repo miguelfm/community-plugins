@@ -251,7 +251,7 @@ local function assessTriage(metric, percent, elapsedPct, windowLabel, item, stag
     if isWeekly and advice and advice.status == "claim" then
         return {
             status = "claim_reset",
-            label = "Claim Reset",
+            label = advice.scope and advice.scope.model and ("Claim " .. advice.scope.model .. " Reset") or "Claim Reset",
             glyph = "ticket",
             color = "#c084fc",
             bg = "tertiary/0.22",
@@ -286,10 +286,11 @@ local function assessTriage(metric, percent, elapsedPct, windowLabel, item, stag
             summary = string.format("Claim before %s · ~%.1fh needed / %.1fh available · up to ~%d%% extra quota%s",
                 os.date("%b %d %H:%M %Z", urgency.deadlineAt), urgency.neededHours, urgency.availableHours,
                 math.floor(advice.cycleGain + 0.5), urgency.feasible and "" or " · 95% may be unreachable in this window")
+            summary = shared.resetCreditScopeSummary(advice, summary)
         end
         return {
             status = "fast_track",
-            label = "Fast-track",
+            label = advice.scope and advice.scope.model and ("Fast-track · " .. advice.scope.model) or "Fast-track",
             glyph = "flame",
             color = "#38bdf8",
             bg = "primary/0.20",
@@ -299,7 +300,7 @@ local function assessTriage(metric, percent, elapsedPct, windowLabel, item, stag
         }
     end
 
-    local gearing = getModelGearing(item and (item.providerId or (item.entry and item.entry.id)), item and item.name) or 10.0
+    local gearing = getModelGearing(item and (item.providerId or (item.entry and item.entry.id)), item and item.name, item) or 10.0
     local oneSessionPct = 100.0 / gearing
     local sessionsNeeded = remainingQuota / oneSessionPct
 
@@ -787,8 +788,11 @@ local function renderMetricCard(item, metric, windowLabel, staggerPlan, typo)
         local gearing, isCalibrated = getModelGearing(item and (item.providerId or (item.entry and item.entry.id)), item and item.name, item)
         if gearing then
             local oneSessionPct = math.floor((100.0 / gearing) + 0.5)
-            local tipText = string.format("Gearing: ~%d full 5h sessions per week (1 session burns ~%d%% weekly quota%s)",
-                math.floor(gearing + 0.5), oneSessionPct, isCalibrated and " · calibrated from observed usage" or "")
+            local isStraddling = shared.isSessionStraddlingWeeklyReset(item)
+            local tipText = string.format("Gearing: ~%d full 5h sessions per week (1 session burns ~%d%% weekly quota%s%s)",
+                math.floor(gearing + 0.5), oneSessionPct,
+                isCalibrated and " · calibrated from observed usage" or "",
+                isStraddling and " · session spans weekly renewal" or "")
             bottomRowElements[#bottomRowElements + 1] = ui.row({
                 gap = 4, align = "center", justify = "center",
                 paddingH = 7,
@@ -847,13 +851,17 @@ local function renderMetricCard(item, metric, windowLabel, staggerPlan, typo)
                 }),
             })
         elseif isStarted then
+            local isStraddling = shared.isSessionStraddlingWeeklyReset(item)
+            local tip = isStraddling
+                and "5-hour rolling session window currently active · spans across weekly renewal"
+                or "5-hour rolling session window currently active"
             bottomRowElements[#bottomRowElements + 1] = ui.row({
                 gap = 4, align = "center", justify = "center",
                 paddingH = 7,
                 paddingV = 2,
                 radius = 5,
                 fill = "primary/0.10",
-                tooltip = "5-hour rolling session window currently active",
+                tooltip = tip,
             }, {
                 ui.glyph({ name = "bolt", size = gs(12), color = "primary" }),
                 ui.label({
@@ -995,28 +1003,40 @@ local function renderCreditCard(credit, typo)
         creditRow[#creditRow + 1] = openBtn
     end
 
+    local scope = credit.scope or {}
     local body = {
         ui.row({ gap = 6, align = "center", tooltip = credit.fullTitle }, creditRow),
-        ui.row({
-            gap = 5, align = "center",
-            paddingH = 2,
-        }, {
-            ui.glyph({ name = "clock", size = gs(13), color = fgColor }),
-            ui.label({
-                text = credit.expiry,
-                fontSize = fs(13),
-                fontWeight = "medium",
-                color = fgColor,
-                maxLines = 1,
-            }),
-        }),
     }
-    if credit.advice ~= nil then
+    if scope.model ~= nil then
         body[#body + 1] = ui.label({
-            text = credit.advice,
-            fontSize = fs(11),
-            color = credit.role == "claim" and "on_surface" or "on_surface_variant",
-            maxLines = 2,
+            text = scope.label,
+            fontSize = fs(12), fontWeight = "semibold",
+            color = "primary",
+        })
+    end
+    if scope.detail ~= nil then
+        body[#body + 1] = ui.label({
+            text = scope.detail,
+            fontSize = fs(11), color = "on_surface_variant",
+        })
+    end
+    body[#body + 1] = ui.row({
+        gap = 5, align = "center", paddingH = 2,
+    }, {
+        ui.glyph({ name = "clock", size = gs(13), color = fgColor }),
+        ui.label({
+            text = credit.expiry,
+            fontSize = fs(13), fontWeight = "medium", color = fgColor, maxLines = 1,
+        }),
+    })
+    if credit.advice ~= nil then
+        body[#body + 1] = ui.row({ tooltip = credit.adviceTooltip or credit.advice }, {
+            ui.label({
+                text = credit.advice, flexGrow = 1,
+                fontSize = fs(11),
+                color = credit.role == "claim" and "on_surface" or "on_surface_variant",
+                maxLines = 2,
+            }),
         })
     end
     return ui.column(cardStyle(4, nil, nil, 8), body)
@@ -1532,7 +1552,8 @@ function render()
                                fontWeight = "bold", color = "on_surface" }),
                 }),
                 ui.label({
-                    text = noctalia.tr("ui.no_providers") or "No providers configured or reachable.",
+                    text = polling and (noctalia.tr("ui.loading") or "Loading…")
+                        or (noctalia.tr("ui.no_providers") or "No providers configured or reachable."),
                     fontSize = fs(13),
                     color = "on_surface_variant",
                 }),
@@ -1570,13 +1591,13 @@ function onOpen(context)
     if type(context) == "string" and context ~= "" then
         noctalia.state.set("selected", context)
     end
-    requestRefresh()
     report = noctalia.state.get("report")
     failure = asFailure(noctalia.state.get("error"))
     polling = noctalia.state.get("polling") == true
     refreshQueued = noctalia.state.get("refresh_queued") == true
     panel.setWantsSecondTicks(true)
     render()
+    requestRefresh()
 end
 
 function update()

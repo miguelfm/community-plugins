@@ -447,6 +447,49 @@ assert(#multiCards == 2, "both credits are listed")
 assert(multiCards[1].role == "claim" and multiCards[1].advice ~= nil, "the earliest credit is the one to claim")
 assert(multiCards[2].role == nil and multiCards[2].advice == nil, "later credits stay unclaimed")
 
+-- Scope stays attached to each offer, including a launch credit with no model
+-- metric, and must not leak between accounts or be inferred from a launch name.
+local launchTitle = "New model launch: one Fable reset for Pro and Team Standard, launch week only"
+local scoped = creditCandidate(3, 161, 168)
+scoped.reset_credits.credits[1].title = launchTitle
+local scopedPlan, scopedStats = shared.analyzeResetCredits({ scoped }, os.time(), calendarHours)
+local scopedCards = shared.collectResetCredits({ scoped }, scopedPlan)
+assert(scopedCards[1].scope.model == "Fable" and scopedCards[1].scope.label == "Fable reset",
+    "launch credits must expose their model even without a model-specific metric")
+assert(scopedCards[1].fullTitle == launchTitle and scopedStats.anthropic.advice.lastChance,
+    "scope labeling must preserve the source title and last-chance detection")
+assert(scopedStats.anthropic.advice.summary:find("Estimate uses total weekly quota", 1, true),
+    "model-specific advice must disclose that its estimate uses the overall weekly metric")
+local scopeCases = {
+    { "FABLE limit reset", "Fable" },
+    { "Fable 5.2 reset", "Fable" },
+    { "Full reset (Fable only)", "Fable" },
+    { "Reset for Sonnet", "Sonnet" },
+    { "Fable launch: Full reset", nil },
+    { "Full reset (Weekly + 5 hr)", nil },
+    { "Unfable reset", nil },
+    { "Special launch offer", nil },
+}
+for _, c in ipairs(scopeCases) do
+    assert(shared.resetCreditScope(c[1], scoped).model == c[2], "incorrect scope for " .. c[1])
+end
+local customModel = creditCandidate(3, 161, 168)
+customModel.metrics[#customModel.metrics + 1] = { label = "Aurora (7d)", percent = 0, window_secs = 604800 }
+assert(shared.resetCreditScope("Aurora reset", customModel).model == "Aurora",
+    "model labels from provider metrics must work beyond the known Claude families")
+local general = creditCandidate(100, 96, 240)
+general.id = "anthropic@work"
+general.reset_credits.credits[1].title = "Full reset (Weekly + 5 hr)"
+local mixedPlan = shared.analyzeResetCredits({ scoped, general }, os.time(), calendarHours)
+local mixedCards = shared.collectResetCredits({ scoped, general }, mixedPlan)
+assert(mixedCards[1].scope.model == "Fable" and mixedCards[2].scope.label == nil
+    and mixedCards[2].scope.model == nil and not mixedCards[2].advice:find("Fable", 1, true),
+    "a model-specific offer must not relabel a different account's general reset")
+scoped.reset_credits = nil
+scoped.sections = { { type = "block", label = "Reset credits", body = { "Fable reset · expires in 7d" } } }
+assert(shared.collectResetCredits({ scoped })[1].scope.model == "Fable",
+    "legacy text-only credits must expose model scope too")
+
 -- Same-day renewal and credit expiration (e.g. Codex renewing in 5d on Oct 22 and expiring on Oct 22)
 local sameDayCandidate = {
     id = "openai",
@@ -574,6 +617,38 @@ end
 local geminiOverridden, isOverCal = shared.getModelGearing("gemini", "Gemini")
 assert(geminiOverridden == 5.5 and isOverCal == false, "gearing_gemini override via double config should be 5.5")
 noctalia.getConfig = nil
+
+-- Straddling session test: a session starting before weekly reset must NOT calibrate gearing
+local straddlingItem = {
+    providerId = "gemini",
+    name = "Gemini",
+    sessionMetric = { percent = 10, window_secs = 18000, reset_at = "2026-11-01T11:53:39Z" },
+    weeklyMetric = { percent = 0, window_secs = 604800, reset_at = "2026-11-08T09:15:38Z" },
+}
+assert(shared.isSessionStraddlingWeeklyReset(straddlingItem) == true, "session spanning weekly reset must be detected as straddling")
+
+shared.recordTelemetrySample(straddlingItem)
+straddlingItem.sessionMetric.percent = 35 -- delta S = 25%
+straddlingItem.weeklyMetric.percent = 5  -- delta W = 5% (would distort K to 5.0)
+shared.recordTelemetrySample(straddlingItem)
+
+local gStraddle, isCalStraddle = shared.getModelGearing("gemini", "Gemini", straddlingItem)
+assert(isCalStraddle == false, "straddling session must NOT calibrate gearing")
+assert(gStraddle == 8.0, "straddling session must retain baseline gearing (8.0)")
+
+-- Once the 5h session naturally resets into a fresh session entirely within the new week:
+straddlingItem.sessionMetric.percent = 0
+straddlingItem.sessionMetric.reset_at = "2026-11-01T16:53:39Z" -- new 5h window
+assert(shared.isSessionStraddlingWeeklyReset(straddlingItem) == false, "new session inside week must not be straddling")
+
+shared.recordTelemetrySample(straddlingItem)
+straddlingItem.sessionMetric.percent = 64
+straddlingItem.weeklyMetric.percent = 13 -- dS = 64%, dW = 8% -> K = 8.0
+shared.recordTelemetrySample(straddlingItem)
+
+local gFresh, isCalFresh = shared.getModelGearing("gemini", "Gemini", straddlingItem)
+assert(isCalFresh == true, "clean session within same week must calibrate normally")
+assert(gFresh == 8.0, "clean session must calibrate to true ratio 8.0")
 
 -- Midweek comparison:
 -- Codex (K=6.3, 1 full session burns ~15.9% of the week; needs 3.78 sessions for the remaining 60%)
@@ -735,7 +810,44 @@ local claudeSprintScore = shared.calculateModelTriageScore(distantClaude, stagge
 local codexSprintScore = shared.calculateModelTriageScore(distantCodex, stagger, os.time(), cfg, true)
 assert(geminiSprintScore > claudeSprintScore and geminiSprintScore > codexSprintScore,
     string.format("Gemini with imminent reset in ~1h (score %.1f) must outrank Claude (%.1f) and Codex (%.1f)", geminiSprintScore, claudeSprintScore, codexSprintScore))
--- 11. Typography scaling & preset proportionality test:
+
+-- 11. 5h Session rush coupling with weekly horizon and headroom:
+-- Claude with 6d 11h left until weekly renewal and low weekly usage (18%) must NOT be rushed
+-- simply because its 5h session is 75% elapsed. Gemini with a closer weekly reset (4d 20h)
+-- and similar weekly usage (19%) must be prioritized over Claude.
+local weekdayTime = 1731063600 -- Friday 11:00 UTC (active workday)
+local function isoAt(s) return os.date("!%Y-%m-%dT%H:%M:%SZ", weekdayTime + s) end
+local startOfWeekClaude = {
+    name = "Claude",
+    providerId = "anthropic",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 44, window_secs = 18000, reset_at = isoAt(4680) }, -- 1h 18m left
+    weeklyMetric = { percent = 18, window_secs = 604800, reset_at = isoAt(558000) }, -- 6d 11h left
+}
+local closerResetGemini = {
+    name = "Gemini",
+    providerId = "gemini",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 1, window_secs = 18000, reset_at = isoAt(16440) }, -- 4h 34m left
+    weeklyMetric = { percent = 19, window_secs = 604800, reset_at = isoAt(417000) }, -- 4d 20h left
+}
+local unstartedGemini = {
+    name = "Gemini",
+    providerId = "gemini",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 0, window_secs = 18000, reset_at = nil }, -- uninitiated 5h session
+    weeklyMetric = { percent = 19, window_secs = 604800, reset_at = isoAt(417000) }, -- 4d 20h left
+}
+local claudeScore = shared.calculateModelTriageScore(startOfWeekClaude, nil, weekdayTime, cfg, true)
+local geminiScore = shared.calculateModelTriageScore(closerResetGemini, nil, weekdayTime, cfg, true)
+local unstartedGeminiScore = shared.calculateModelTriageScore(unstartedGemini, nil, weekdayTime, cfg, true)
+
+assert(geminiScore > claudeScore,
+    string.format("Gemini with closer weekly reset in 4d 20h (%.1f) must outrank Claude with 6d 11h (%.1f)", geminiScore, claudeScore))
+assert(unstartedGeminiScore > claudeScore,
+    string.format("Unstarted Gemini with closer weekly reset (%.1f) must outrank Claude (%.1f) despite Claude's active 5h session", unstartedGeminiScore, claudeScore))
+
+-- 12. Typography scaling & preset proportionality test:
 local tDefault = shared.getTypography()
 assert(tDefault.factor == 1.00, "Default typography factor must be 1.00")
 assert(tDefault.fontSize(19) == 19 and tDefault.fontSize(15) == 15 and tDefault.fontSize(9) == 9,
@@ -976,6 +1088,87 @@ local argonItems = shared.collectModelItems({ argonEntry })
 assert(argonItems[2].providerId ~= "claude-oss", "Argon must not inherit the Claude/OSS identity")
 assert(shared.kickstartTarget({ providerId = "anthropic@work", name = "Claude · work" }) == nil,
     "named accounts cannot be kickstarted with the default CLI login")
+
+-- 13. Graduated Multi-Stage Weekly Sprint (Stage 1 Harvesting up to 72h based on gearing vs Stage 2 Critical Sprint <= 24h):
+local preSprintModel = {
+    name = "Claude",
+    providerId = "anthropic",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 30, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(36 * 3600) }, -- 36h left (in pre-sprint)
+}
+local distantWeeklyModel = {
+    name = "Claude",
+    providerId = "anthropic",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 30, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(120 * 3600) }, -- 120h left (day 2 of 7)
+}
+local criticalSprintModel = {
+    name = "Claude",
+    providerId = "anthropic",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 30, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(18 * 3600) }, -- 18h left (critical sprint <= 24h)
+}
+local lowQuotaPreSprint = {
+    name = "Claude",
+    providerId = "anthropic",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 30, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 96, window_secs = 604800, reset_at = isoIn(36 * 3600) }, -- only 4% left
+}
+
+local sDist = shared.calculateModelTriageScore(distantWeeklyModel, nil, now, scheduleConfig, true)
+local sPre = shared.calculateModelTriageScore(preSprintModel, nil, now, scheduleConfig, true)
+local sCrit = shared.calculateModelTriageScore(criticalSprintModel, nil, now, scheduleConfig, true)
+local sLow = shared.calculateModelTriageScore(lowQuotaPreSprint, nil, now, scheduleConfig, true)
+
+assert(sPre > sDist,
+    string.format("Model in pre-sprint (%.1f) must outrank distant day 1-4 model (%.1f)", sPre, sDist))
+assert(sCrit > sPre,
+    string.format("Model in <=24h critical sprint (%.1f) must outrank pre-sprint model (%.1f)", sCrit, sPre))
+assert(sPre > sLow,
+    string.format("Pre-sprint model with 60%% headroom (%.1f) must outrank low-headroom 4%% model (%.1f) to prevent premature void", sPre, sLow))
+
+-- Gearing-aware 72h horizon: Gemini (Km=8) opens harvesting at 72h (Day 5), whereas low-gearing Claude OSS (Km=2.5) stays protected until 48h:
+local gemini60h = {
+    name = "Gemini",
+    providerId = "gemini",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 10, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(60 * 3600) },
+}
+local gemini120h = {
+    name = "Gemini",
+    providerId = "gemini",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 10, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(120 * 3600) },
+}
+local sG60 = shared.calculateModelTriageScore(gemini60h, nil, now, scheduleConfig, true)
+local sG120 = shared.calculateModelTriageScore(gemini120h, nil, now, scheduleConfig, true)
+assert(sG60 > sG120,
+    string.format("Gemini with Km=8 at 60h (%.1f) must outrank Gemini at 120h (%.1f) via 72h harvesting window", sG60, sG120))
+
+local claudeOss60h = {
+    name = "Claude & GPT OSS",
+    providerId = "claude-oss",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 10, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(60 * 3600) },
+}
+local claudeOss36h = {
+    name = "Claude & GPT OSS",
+    providerId = "claude-oss",
+    entry = { status = "ready" },
+    sessionMetric = { percent = 10, window_secs = 18000, reset_at = isoIn(10000) },
+    weeklyMetric = { percent = 40, window_secs = 604800, reset_at = isoIn(36 * 3600) },
+}
+local sOss60 = shared.calculateModelTriageScore(claudeOss60h, nil, now, scheduleConfig, true)
+local sOss36 = shared.calculateModelTriageScore(claudeOss36h, nil, now, scheduleConfig, true)
+assert(sOss36 > sOss60,
+    string.format("Claude OSS at 36h (%.1f) must outrank Claude OSS at 60h (%.1f) as 60h is outside its 48h window", sOss36, sOss60))
 
 io.write("ok: shared timestamps, availability, provider order, mathematical triage score, reset staggering, typography scale presets, and 1.40 compat\n")
 

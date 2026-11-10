@@ -1043,6 +1043,53 @@ function M.severityRole(section, calm)
 end
 
 -- ── Reset credit analysis and staggering plan ─────────────────────────────────
+-- The CLI currently supplies scope in the offer title, not a structured field.
+-- Require an explicit reset/model association: a launch mentioning a model is
+-- not, by itself, evidence that a full reset is restricted to that model.
+function M.resetCreditScope(title, entry)
+    local text = trim(tostring(title or ""))
+    local lower = text:lower()
+    local models = { "Fable", "Opus", "Sonnet", "Haiku" }
+    for _, metric in ipairs(type(entry) == "table" and type(entry.metrics) == "table" and entry.metrics or {}) do
+        if type(metric) == "table" and M.isQuotaMetric(metric) then
+            local name = trim(tostring(metric.label or ""):gsub("%s*%b()", ""))
+            local generic = name:lower()
+            if name ~= "" and not generic:find("week", 1, true)
+                and not generic:find("session", 1, true)
+                and generic ~= tostring(entry.display_name or entry.name or entry.id or ""):lower() then
+                models[#models + 1] = name
+            end
+        end
+    end
+    for _, model in ipairs(models) do
+        local pattern = model:lower():gsub("([^%w])", "%%%1")
+        local start = "%f[%w]" .. pattern
+        if lower:find(start .. "%s+reset%f[%W]")
+            or lower:find(start .. "%s+limit%s+reset%f[%W]")
+            or lower:find(start .. "%s+[%d%.]+%s+reset%f[%W]")
+            or lower:find(start .. "[%- ]only%f[%W]")
+            or lower:find("%f[%w]reset%s+for%s+" .. pattern .. "%f[%W]") then
+            local session = M.dualMetrics(entry and entry.metrics)
+            return { model = model, label = model .. " reset",
+                detail = M.baseProvider(entry and entry.id) == "anthropic" and model:lower() == "fable"
+                    and ("Weekly: this model only" .. (session and " · 5h: all models" or ""))
+                    or "Model-specific reset" }
+        end
+    end
+    -- General and unrecognized offers need no scope label. Their complete
+    -- source title remains available in the card's tooltip.
+    return {}
+end
+
+function M.resetCreditScopeSummary(advice, summary, includeModel)
+    local scope = advice and advice.scope
+    if scope and scope.model then
+        local prefix = includeModel == false and "" or (scope.label .. ": ")
+        return prefix .. summary .. " · Estimate uses total weekly quota"
+    end
+    return summary
+end
+
 -- A weekly reset credit is worth the quota it lets you burn before the natural
 -- renewal would have refilled the week anyway, minus the unused quota it throws
 -- away. That holds whether a claim zeroes the counter under the same renewal or
@@ -1185,7 +1232,7 @@ function M.resetCreditUrgency(item, advice, nowTime, config, isUserActiveNow)
     local gain = math.min(100, math.max(0, tonumber(advice.cycleGain) or 0))
     if not expiresAt or expiresAt <= now or not renewAt or gain <= 0 then return nil end
 
-    local gearing = M.getModelGearing(item.providerId or (item.entry and item.entry.id), item.name)
+    local gearing = M.getModelGearing(item.providerId or (item.entry and item.entry.id), item.name, item)
     local percent = tonumber(item.weeklyMetric.percent) or 0
     local toSpend = math.max(0, M.CLAIM_MIN_WEEKLY_PCT - percent)
     local needed = toSpend * gearing / 20.0
@@ -1258,6 +1305,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
                         title = rc.title or "Full reset",
                         expiresAt = expAt,
                         remainingSecs = expAt - nowTime,
+                        scope = M.resetCreditScope(rc.title, entry),
                     }
                 end
             end
@@ -1277,6 +1325,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
                                 title = text:match("^(.-)%s+·") or text,
                                 expiresAt = expAt,
                                 remainingSecs = expAt - nowTime,
+                                scope = M.resetCreditScope(text:match("^(.-)%s+·") or text, entry),
                             }
                         end
                     end
@@ -1307,6 +1356,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
                 entry = entry,
             }
             stats.advice = adviseResetCredit(stats, M.getModelGearing(id, displayName), nowTime, scheduleConfig)
+            stats.advice.scope = earliest and earliest.scope
             stats.canClaimNow = stats.advice.status == "claim"
             providerStats[id] = stats
             if earliest then
@@ -1402,6 +1452,8 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
     end
 
     for id, stats in pairs(providerStats) do
+        stats.advice.cardSummary = M.resetCreditScopeSummary(stats.advice, stats.advice.summary, false)
+        stats.advice.summary = M.resetCreditScopeSummary(stats.advice, stats.advice.summary)
         if staggerPlan.fastTrack[id] then
             local session, weekly = M.dualMetrics(stats.entry.metrics)
             stats.advice.urgency = M.resetCreditUrgency({ entry = stats.entry, providerId = id,
@@ -1547,7 +1599,8 @@ function M.collectResetCredits(candidates, staggerPlan)
                 providerName = tostring(entry.display_name or entry.name or providerId or ""),
                 glyph = M.providerGlyph(providerId),
                 expiry = expiryText or "Expiration not reported",
-                fullTitle = title or "Full reset",
+                fullTitle = title or "Reset scope not reported",
+                scope = M.resetCreditScope(title, entry),
                 expiresAt = expiresAt or math.huge,
                 role = role,
             }
@@ -1596,7 +1649,8 @@ function M.collectResetCredits(candidates, staggerPlan)
         if not seen[id] then
             seen[id] = true
             local advice = staggerPlan and staggerPlan.creditAdvice and staggerPlan.creditAdvice[id]
-            credit.advice = advice and advice.summary or nil
+            credit.advice = advice and (advice.cardSummary or advice.summary) or nil
+            credit.adviceTooltip = advice and advice.summary or nil
             if staggerPlan and staggerPlan.optimalClaimProviders and staggerPlan.optimalClaimProviders[id] then
                 credit.role = "claim"
             end
@@ -1777,6 +1831,26 @@ function M.modelTelemetryKey(providerId, modelName)
     return pid ~= "" and pid or "default"
 end
 
+-- Determines if a 5h rolling session window spans/straddles across a weekly reset boundary.
+-- Intervals spanning session or weekly resets must be excluded from empirical calibration
+-- because usage is split between the prior cycle and the new cycle.
+function M.isSessionStraddlingWeeklyReset(item)
+    if type(item) ~= "table" then return false end
+    local sMetric = item.sessionMetric
+    local wMetric = item.weeklyMetric
+    if type(sMetric) ~= "table" or type(wMetric) ~= "table" then return false end
+    local sAt = M.parseIso(sMetric.reset_at)
+    local wAt = M.parseIso(wMetric.reset_at)
+    local sWindow = tonumber(sMetric.window_secs) or 18000
+    local wWindow = tonumber(wMetric.window_secs) or 604800
+    if sAt and wAt and sWindow > 0 and wWindow > 0 then
+        local sStart = sAt - sWindow
+        local wStart = wAt - wWindow
+        return sStart < wStart and sAt > wStart
+    end
+    return false
+end
+
 -- Record a telemetry sample from an item with both 5h session and 7d weekly metrics.
 -- When quota is consumed during an active session, computes empirical gearing:
 -- K_obs = Delta Session % / Delta Weekly %
@@ -1794,6 +1868,7 @@ function M.recordTelemetrySample(item)
     local key = M.modelTelemetryKey(item.providerId or (item.entry and item.entry.id), item.name)
     local sReset = tostring(sMetric.reset_at or "")
     local wReset = tostring(wMetric.reset_at or "")
+    local isStraddling = M.isSessionStraddlingWeeklyReset(item)
 
     local telemetry = M.telemetryBaselines
     if type(noctalia) == "table" and type(noctalia.state) == "table" and type(noctalia.state.get) == "function" then
@@ -1810,6 +1885,7 @@ function M.recordTelemetrySample(item)
             w_reset = wReset,
             k_calibrated = nil,
             obs_samples = 0,
+            straddling_reset = isStraddling or nil,
         }
         telemetry[key] = rec
     else
@@ -1818,12 +1894,25 @@ function M.recordTelemetrySample(item)
         local sessionDropped = (rec.s_base > 25 and sPct <= 5)
         local weekReset = (wReset ~= "" and rec.w_reset ~= "" and wReset ~= rec.w_reset)
 
-        if resetChanged or sessionDropped or weekReset then
+        if resetChanged or sessionDropped then
             rec.s_base = sPct
             rec.w_base = wPct
             rec.s_reset = sReset
             rec.w_reset = wReset
+            rec.straddling_reset = isStraddling or nil
+        elseif weekReset or isStraddling then
+            rec.s_base = sPct
+            rec.w_base = wPct
+            rec.s_reset = sReset
+            rec.w_reset = wReset
+            rec.straddling_reset = true
+            -- Discard any calibration derived during this straddling session window
+            if rec.last_sample_s_reset == sReset then
+                rec.k_calibrated = nil
+                rec.obs_samples = 0
+            end
         else
+            rec.straddling_reset = nil
             if sPct < rec.s_base then
                 rec.s_base = sPct
                 rec.w_base = wPct
@@ -1835,6 +1924,7 @@ function M.recordTelemetrySample(item)
                     local k_sample = dS / dW
                     if k_sample >= 1.5 and k_sample <= 30.0 then
                         rec.obs_samples = (rec.obs_samples or 0) + 1
+                        rec.last_sample_s_reset = sReset
                         if rec.k_calibrated == nil then
                             rec.k_calibrated = math.floor(k_sample * 10 + 0.5) / 10
                         else
@@ -1872,15 +1962,17 @@ function M.getModelGearing(providerId, modelName, item)
         end
     end
 
-    -- 2. Check dynamic empirical telemetry calibration
-    local telemetry = M.telemetryBaselines
-    if type(noctalia) == "table" and type(noctalia.state) == "table" and type(noctalia.state.get) == "function" then
-        local st = noctalia.state.get("gearing_telemetry")
-        if type(st) == "table" then telemetry = st end
-    end
-    local rec = telemetry and telemetry[key]
-    if rec and rec.k_calibrated and rec.k_calibrated > 0 then
-        return rec.k_calibrated, true
+    -- 2. Check dynamic empirical telemetry calibration (inhibited while session straddles a weekly reset)
+    if not (item and M.isSessionStraddlingWeeklyReset(item)) then
+        local telemetry = M.telemetryBaselines
+        if type(noctalia) == "table" and type(noctalia.state) == "table" and type(noctalia.state.get) == "function" then
+            local st = noctalia.state.get("gearing_telemetry")
+            if type(st) == "table" then telemetry = st end
+        end
+        local rec = telemetry and telemetry[key]
+        if rec and rec.k_calibrated and rec.k_calibrated > 0 and not rec.straddling_reset then
+            return rec.k_calibrated, true
+        end
     end
 
     -- 3. Default empirical baseline
@@ -2095,13 +2187,14 @@ function M.calculateModelTriageScore(item, staggerPlan, nowTime, scheduleConfig,
     ----------------------------------------------------------------------
     -- 1. WEEKLY MATHEMATICAL MODEL (7d): Velocity, Capacity & Gearing
     ----------------------------------------------------------------------
-    local gearing = M.getModelGearing(item.providerId or (item.entry and item.entry.id), item.name)
+    local gearing = M.getModelGearing(item.providerId or (item.entry and item.entry.id), item.name, item)
 
     local wFactor = 1.0
     local uResetWeekly = 0.0
     local uBottleneck = 0.0
     local dutyCycle = 0.0
     local H_w = 0.0
+    local sessionRushWeight = 1.0
 
     if wMetric ~= nil and M.weeklyResetStatus(wMetric, item.entry, nowTime) == "announced" then
         local wAt = wMetric and M.parseIso(wMetric.reset_at)
@@ -2122,22 +2215,57 @@ function M.calculateModelTriageScore(item, staggerPlan, nowTime, scheduleConfig,
         local oneSessionPct = 100.0 / gearing
         local lowHeadroomPct = math.min(30.0, math.max(8.0, oneSessionPct * 0.80))
 
+        local wRemSecs = (wAt and wAt > nowTime) and (wAt - nowTime) or 0
+        local remCalHours = wRemSecs / 3600.0
+        local sprintH = H_w
+        local isCriticalSprint = (sprintH <= 24.0 or remCalHours <= 24.0)
+
+        -- Harvesting horizon scales with model gearing (Km):
+        -- High/moderate gearing models (e.g. Gemini Km=8, Claude Pro Km=7, Codex Km=6.3) require
+        -- multiple 5h sessions to absorb their weekly quota without non-thinking token bottlenecks,
+        -- so their harvesting window opens up to 72h (3 days).
+        -- Low-gearing models (e.g. Claude OSS Km=2.5) where 1 session burns ~40% of the week remain
+        -- protected at 48h to prevent premature exhaustion days before renewal.
+        local harvestHorizonHours = 48.0
+        if gearing > 3.5 then
+            harvestHorizonHours = 48.0 + 24.0 * math.min(1.0, (gearing - 3.5) / 3.5)
+        end
+        local activeHarvestHorizon = harvestHorizonHours * 0.75
+
+        local isPreSprint = not isCriticalSprint and (remCalHours <= harvestHorizonHours or sprintH <= activeHarvestHorizon)
+
+        -- Progressive harvesting curve over the harvesting window (harvestHorizon -> 24h):
+        local preProgress = 0.0
+        if isPreSprint then
+            local calProgress = (harvestHorizonHours > 24.0)
+                and math.max(0.0, (harvestHorizonHours - remCalHours) / (harvestHorizonHours - 24.0))
+                or 0.0
+            local activeProgress = (activeHarvestHorizon > 24.0)
+                and math.max(0.0, (activeHarvestHorizon - sprintH) / (activeHarvestHorizon - 24.0))
+                or 0.0
+            preProgress = math.min(1.0, math.max(calProgress, activeProgress))
+        end
+
         -- Temporal distribution & anti-burst smoothing (prevents concentration of usage followed by voids):
-        -- When there are still many active hours left in the week (H_w > 24.0):
+        -- When not in the critical final sprint (isCriticalSprint == false):
         -- Evaluate pacing relative to elapsed time in the 7-day cycle.
         local paceSmooth = 1.0
-        if H_w > 24.0 and wMetric.window_secs then
+        if not isCriticalSprint and wMetric.window_secs then
             local wWindow = tonumber(wMetric.window_secs) or 604800
-            local wRemSecs = (wAt and wAt > nowTime) and (wAt - nowTime) or 0
             local wElapsedRatio = math.min(1.0, math.max(0.0, (wWindow - wRemSecs) / wWindow))
             local expectedBurn = wElapsedRatio * 100.0
             local overPace = wPct - expectedBurn
-            if overPace > 15.0 then
+            -- In harvesting phase (Stage 1), relax pace tolerance from 5% up to 12% to facilitate harvesting:
+            local paceTol = 5.0
+            if isPreSprint then
+                paceTol = 5.0 + 7.0 * preProgress
+            end
+            if overPace > paceTol then
                 -- Ahead of pace: smoothly dampen to avoid exhausting quota days before renewal
-                paceSmooth = math.max(0.35, 1.0 - 0.02 * (overPace - 15.0))
-            elseif overPace < -15.0 then
+                paceSmooth = math.max(0.35, 1.0 - 0.02 * (overPace - paceTol))
+            elseif overPace < -paceTol then
                 -- Behind pace: gently favor to ensure smooth utilization of available quota
-                paceSmooth = math.min(1.35, 1.0 + 0.015 * (-overPace - 15.0))
+                paceSmooth = math.min(1.35, 1.0 + 0.015 * (-overPace - paceTol))
             end
         end
 
@@ -2148,14 +2276,22 @@ function M.calculateModelTriageScore(item, staggerPlan, nowTime, scheduleConfig,
             wFactor = math.min(1.80, math.max(0.20, (0.40 + 0.60 * gearedPi_w) * paceSmooth))
         end
 
-        -- Time-arbitrage and perishability urgency for imminent weekly reset (<= 24 active hours):
+        -- Time-arbitrage and perishability urgency: Graduated Weekly Sprint
+        -- Stage 2: Critical Final Sprint (<= 24 active hours or <= 24 calendar hours)
         -- Reflects that quotas expire permanently if not consumed.
-        -- When active hours <= 24h, remaining 5h sessions are scarce.
-        local sprintH = H_w
-        if sprintH <= 24.0 and wFree > 0.5 then
+        if isCriticalSprint and wFree > 0.5 then
             local ratio = math.min(8.0, (24.0 / math.max(0.5, sprintH)) ^ 1.25)
             local sprintBonus = sprintH <= 3.0 and (220.0 * (3.0 - sprintH) / 3.0) or 0.0
             uResetWeekly = 50.0 + sprintBonus + (wFree * 4.0 * ratio)
+        elseif isPreSprint and wFree > 0.5 then
+            -- Stage 1: Pre-Sprint / Graduated Harvesting (24h < remaining <= harvestHorizonHours)
+            -- Elevates models nearing the end of their weekly window, scaled by gearing,
+            -- remaining headroom and progressive approach toward the final sprint.
+            local headroomScale = (wFree <= lowHeadroomPct and sprintH > 24.0)
+                and math.max(0.20, wFree / lowHeadroomPct)
+                or 1.0
+            local curveProgress = preProgress ^ 1.15
+            uResetWeekly = 30.0 * (wFree / 100.0) * curveProgress * headroomScale
         end
 
         -- Unified capacity bottleneck urgency when session slots are scarce:
@@ -2163,6 +2299,18 @@ function M.calculateModelTriageScore(item, staggerPlan, nowTime, scheduleConfig,
             local excess = math.min(1.5, dutyCycle - 0.50)
             uBottleneck = 20.0 * (wFree / 100.0) * excess
         end
+
+        -- Coupling 5h session rush urgency with weekly horizon and headroom:
+        -- In a week with few session slots (low gearing), burning a 5h session must be
+        -- weighed against how much weekly quota was already spent and time remaining.
+        -- When nearly a full week remains (H_w > 60h) and dutyCycle is low, there are abundant
+        -- session slots ahead, so an expiring 5h session does not waste weekly budget.
+        -- When dutyCycle is high (sessions scarce) or weekly reset approaches with unspent quota,
+        -- session urgency increases to ensure weekly quota is fully harvested.
+        local dutyUrgency = math.min(1.0, math.max(0.0, (dutyCycle - 0.20) / 0.50))
+        local horizonUrgency = math.min(1.0, math.max(0.0, (60.0 - H_w) / 36.0))
+        local headroomFactor = (wFree <= lowHeadroomPct and H_w > 24.0) and math.max(0.20, wFree / lowHeadroomPct) or 1.0
+        sessionRushWeight = math.min(1.0, math.max(0.15, math.max(dutyUrgency, horizonUrgency) * headroomFactor))
     end
 
     ----------------------------------------------------------------------
@@ -2181,16 +2329,19 @@ function M.calculateModelTriageScore(item, staggerPlan, nowTime, scheduleConfig,
         if H_s < 0.05 then H_s = 0.05 end
 
         if sStarted then
-            -- Active session: 5h timer is running
+            -- Active session: 5h timer is running.
+            -- Urgency to rush the remainder of the 5h session is modulated by sessionRushWeight
+            -- to reflect weekly headroom and time-to-reset:
             local sElapsedRatio = math.min(1.0, math.max(0.0, (sWindow - sRemainingSecs) / sWindow))
-            local sUrgencyFactor = 1.0 + 1.80 * (sElapsedRatio * sElapsedRatio)
+            local sUrgencyFactor = 1.0 + (1.80 * sessionRushWeight) * (sElapsedRatio * sElapsedRatio)
             local baseSession = sFree * sUrgencyFactor
 
-            -- Critical session burn urgency if effective active time before sleep/reset <= 1.5h
+            -- Session burn urgency if effective active time before sleep/reset <= 1.5h,
+            -- modulated by sessionRushWeight and weekly pace factor:
             local uBurnSession = 0.0
             if H_s <= 1.50 and sFree >= 15.0 then
                 local burnUrgency = (1.50 - H_s) / 1.50
-                uBurnSession = 50.0 * (sFree / 100.0) * burnUrgency
+                uBurnSession = 50.0 * sessionRushWeight * (sFree / 100.0) * burnUrgency * wFactor
             end
 
             -- Coupling: session velocity modulated by weekly pace factor and bonuses

@@ -80,7 +80,7 @@ Empirically calibrated baseline values across supported providers:
 | `openai` | OpenAI Codex | **6.3** | $15.9\%$ | $6.3$ sessions |
 | *Default* | Custom / Unknown Provider | **10.0** | $10.0\%$ | $10.0$ sessions |
 
-The Codex baseline is estimated from 12 comparable usage intervals on October 1–12, 2026: $\sum \Delta S / \sum \Delta W = 512 / 81 \approx 6.3$. Intervals spanning session or weekly resets are excluded. A full session means consumption of 100% of the 5h quota; reset credits are excluded from this capacity estimate. Rounded percentages and future changes in limits can affect the ratio.
+The Codex baseline is estimated from 12 comparable usage intervals on October 1–12, 2026: $\sum \Delta S / \sum \Delta W = 512 / 81 \approx 6.3$. Intervals spanning session or weekly resets are excluded. Active 5h sessions that straddle a weekly renewal boundary ($t_{\text{session\_start}} < t_{\text{weekly\_start}} < t_{\text{session\_reset}}$) are quarantined: empirical telemetry calibration is inhibited and defaults to baseline gearing until a clean session begins entirely within the new weekly cycle. A full session means consumption of 100% of the 5h quota; reset credits are excluded from this capacity estimate. Rounded percentages and future changes in limits can affect the ratio.
 
 ##### Dynamic Telemetry-Based Gearing Calibration:
 In addition to baseline defaults, `ai-triage` continuously observes real consumption deltas during active sessions:
@@ -116,18 +116,34 @@ $$\text{lowHeadroomPct} = \min(30.0, \max(8.0, \text{oneSessionPct} \times 0.80)
 ##### Temporal Distribution & Anti-Burst Smoothing ($P_{\text{smooth}}$):
 To optimize global multi-service consumption while preventing rapid quota concentration followed by availability droughts ("baleiros"), the model monitors deviation from nominal weekly pace:
 $$\Delta_{\text{pace}} = U_{i,w} - \left(\frac{T_w - \tau_w}{T_w} \times 100\right)$$
-When $H_w > 24.0\text{h}$:
+When not in the critical final sprint ($H_w > 24.0\text{h}$ and $\tau_w > 24.0\text{h}$):
+$$\text{paceTol} = \begin{cases}
+5.0 + 7.0 \times \text{preProgress} & \text{if in Stage 1 harvesting } (\tau_w \le \text{harvestHorizonHours} \text{ or } H_w \le \text{activeHarvestHorizon}) \\
+5.0 & \text{otherwise}
+\end{cases}$$
 $$P_{\text{smooth}} = \begin{cases}
-\max\left(0.35, 1.0 - 0.02 \times (\Delta_{\text{pace}} - 15.0)\right) & \text{if } \Delta_{\text{pace}} > 15.0\% \text{ (ahead of pace)} \\
-\min\left(1.35, 1.0 + 0.015 \times (-\Delta_{\text{pace}} - 15.0)\right) & \text{if } \Delta_{\text{pace}} < -15.0\% \text{ (lagging behind pace)} \\
+\max\left(0.35, 1.0 - 0.02 \times (\Delta_{\text{pace}} - \text{paceTol})\right) & \text{if } \Delta_{\text{pace}} > \text{paceTol}\% \text{ (ahead of pace)} \\
+\min\left(1.35, 1.0 + 0.015 \times (-\Delta_{\text{pace}} - \text{paceTol})\right) & \text{if } \Delta_{\text{pace}} < -\text{paceTol}\% \text{ (lagging behind pace)} \\
 1.0 & \text{otherwise}
 \end{cases}$$
-When $H_w \le 24.0\text{h}$, $P_{\text{smooth}} = 1.0$ (damping is released for the final sprint).
+When $H_w \le 24.0\text{h}$ or $\tau_w \le 24.0\text{h}$, $P_{\text{smooth}} = 1.0$ (damping is released for the final sprint).
+
+##### Session Rush Weight ($\beta_{\text{session}}$):
+In services with relatively few 5h sessions per week (e.g. Claude Pro $\approx 7$, Codex $\approx 6.3$, Claude OSS $\approx 2.5$), exhausting a 5h rolling session draws down a significant fraction of the weekly budget. The urgency given to rushing a 5h session before its timer expires must strictly couple to weekly quota spent and time remaining until weekly reset.
+
+When nearly a full week remains ($H_w > 60\text{h}$) and duty cycle is low, there are abundant future session slots ($N_{\text{slots}} \gg N_{\text{needed}}$), meaning an unexhausted 5h session does not waste any weekly quota. Rushing it prematurely would deplete the weekly allowance on day 1 and starve services whose weekly reset is much closer. Conversely, as weekly renewal approaches or when session slots become scarce, session urgency must increase to ensure no weekly quota is forfeited:
+$$\text{dutyUrgency} = \min\left(1.0, \max\left(0.0, \frac{\text{DutyCycle} - 0.20}{0.50}\right)\right)$$
+$$\text{horizonUrgency} = \min\left(1.0, \max\left(0.0, \frac{60.0 - H_w}{36.0}\right)\right)$$
+$$\text{headroomFactor} = \begin{cases}
+\max\left(0.20, \frac{w_{\text{free}}}{\text{lowHeadroomPct}}\right) & \text{if } w_{\text{free}} \le \text{lowHeadroomPct} \text{ and } H_w > 24\text{h} \\
+1.0 & \text{otherwise}
+\end{cases}$$
+$$\beta_{\text{session}} = \min\left(1.0, \max\left(0.15, \max(\text{dutyUrgency}, \text{horizonUrgency}) \times \text{headroomFactor}\right)\right)$$
 
 ##### Weekly Modulation Factor $W_{\text{weekly}}$:
 $$W_{\text{weekly}} = \begin{cases}
 \left(0.08 + 0.15 \times \left(\frac{w_{\text{free}}}{\text{lowHeadroomPct}}\right)\right) \times P_{\text{smooth}} & \text{if } w_{\text{free}} \le \text{lowHeadroomPct} \text{ and } H_w > 24\text{h} \\
-\min\left(W_{\max}, \max\left(0.20, (0.40 + 0.60 \times \Pi_{w, \text{geared}}) \times P_{\text{smooth}}\right)\right) & \text{otherwise}
+\min\left(W_{\max>, \max\left(0.20, (0.40 + 0.60 \times \Pi_{w, \text{geared}}) \times P_{\text{smooth}}\right)\right) & \text{otherwise}
 \end{cases}$$
 where $W_{\max} = 1.80$. Credit incentives are added separately; they do not alter
 weekly smoothing, conservation or the natural renewal horizon.
@@ -136,17 +152,39 @@ weekly smoothing, conservation or the natural renewal horizon.
 
 #### 1.2.4 Dynamic Urgency Additives
 
-##### 1. Perishability & Final Sprint Urgency ($U_{\text{reset\_weekly}}$)
-For any model with unspent weekly quota ($w_{\text{free}} > 0.5\%$) within the perishable horizon ($H_w \le 24.0\text{h}$):
-$$\text{ratio} = \min\left(8.0, \left(\frac{24.0}{\max(0.5, H_w)}\right)^{1.25}\right)$$
-$$\text{sprintBonus} = \begin{cases}
-220.0 \times \left(\frac{3.0 - H_w}{3.0}\right) & \text{if } H_w \le 3.0\text{h} \\
-0.0 & \text{otherwise}
-\end{cases}$$
-$$U_{\text{reset\_weekly}} = 50.0 + \text{sprintBonus} + (w_{\text{free}} \times 4.0 \times \text{ratio})$$
+##### 1. Weekly Perishability & Graduated Multi-Stage Sprint Urgency ($U_{\text{reset\_weekly}}$)
+For any model with unspent weekly quota ($w_{\text{free}} > 0.5\%$):
+
+- **Harvesting Horizon Calibration ($T_{\text{harvest}}$)**:
+  Models with high gearing or without deep thinking token overhead (such as Gemini with $K_m \approx 8\text{--}10$, Claude Pro with $K_m \approx 7$, and Codex with $K_m \approx 6.3$) require significantly more human interactions and multiple 5h session windows to comfortably absorb their weekly allowance. To avoid an impossible cognitive/workload bottleneck in the final 48 hours, their harvesting horizon dynamically expands up to 72 hours (3 full days). Conversely, low-gearing models ($K_m \le 3.5$, e.g. Claude OSS with $K_m \approx 2.5$) remain protected at 48 hours to prevent premature mid-week exhaustion:
+  $$\text{harvestHorizonHours} = \begin{cases}
+  48.0 & \text{if } K_m \le 3.5 \\
+  48.0 + 24.0 \times \min\left(1.0, \frac{K_m - 3.5}{3.5}\right) & \text{if } K_m > 3.5
+  \end{cases}$$
+  $$\text{activeHarvestHorizon} = \text{harvestHorizonHours} \times 0.75$$
+
+- **Stage 2: Critical Final Sprint** ($H_w \le 24.0\text{h}$ or $\tau_w \le 24.0\text{h}$):
+  $$\text{ratio} = \min\left(8.0, \left(\frac{24.0}{\max(0.5, H_w)}\right)^{1.25}\right)$$
+  $$\text{sprintBonus} = \begin{cases}
+  220.0 \times \left(\frac{3.0 - H_w}{3.0}\right) & \text{if } H_w \le 3.0\text{h} \\
+  0.0 & \text{otherwise}
+  \end{cases}$$
+  $$U_{\text{reset\_weekly}} = 50.0 + \text{sprintBonus} + (w_{\text{free}} \times 4.0 \times \text{ratio})$$
+
+- **Stage 1: Graduated Pre-Sprint Harvesting** ($24.0\text{h} < \tau_w \le \text{harvestHorizonHours}$ or $24.0\text{h} < H_w \le \text{activeHarvestHorizon}$):
+  Elevates models in their final 48–72 hours of weekly countdown above day 1–4 models, scaled by gearing, remaining quota, and progress toward the final sprint:
+  $$\text{preProgress} = \min\left(1.0, \max\left(0.0, \max\left(\frac{\text{harvestHorizonHours} - \tau_w / 3600}{\text{harvestHorizonHours} - 24.0}, \frac{\text{activeHarvestHorizon} - H_w}{\text{activeHarvestHorizon} - 24.0}\right)\right)\right)$$
+  $$\text{headroomScale} = \begin{cases}
+  \max\left(0.20, \frac{w_{\text{free}}}{\text{lowHeadroomPct}}\right) & \text{if } w_{\text{free}} \le \text{lowHeadroomPct} \\
+  1.0 & \text{otherwise}
+  \end{cases}$$
+  $$U_{\text{reset\_weekly}} = 30.0 \times \left(\frac{w_{\text{free}}}{100.0}\right) \times (\text{preProgress}^{1.15}) \times \text{headroomScale}$$
+
+- **Otherwise** ($\tau_w > \text{harvestHorizonHours}$ and $H_w > \text{activeHarvestHorizon}$):
+  $$U_{\text{reset\_weekly}} = 0.0$$
 
 > [!IMPORTANT]
-> The final sprint bonus ($\text{sprintBonus}$) ensures that when a provider's weekly reset is within $\le 3\text{h}$, any remaining quota (even $2\text{–}5\%$) receives top triage priority over all distant models, eliminating the previous $5\%$ cutoff cliff and ensuring zero quota is forfeit.
+> The graduated multi-stage sprint bridges the previous cliff effect: models with high gearing (such as Gemini) begin gentle preference at 72 hours (Day 5), progressing into active harvesting at 48 hours (Day 6) with relaxed pace tolerance ($\text{paceTol} \le 12\%$) without human cognitive burnout, while low-gearing tiers remain guarded until 48 hours and the critical final sprint ($\le 24\text{h}$) guarantees zero quota is forfeit.
 
 ##### 2. Session Capacity Bottleneck Urgency ($U_{\text{bottleneck}}$)
 For models facing an impending session capacity squeeze ($\text{DutyCycle} \ge 0.70$):
@@ -160,13 +198,13 @@ $$U_{\text{bottleneck}} = \begin{cases}
 #### 1.2.5 5h Session Window Modeling & Composite Score $J_i(t)$
 
 ##### Case A: Active Session Running ($s_{\text{started}} = \text{true}$)
-Quadratic session decay factor:
-$$\Omega_s(\tau_s) = 1.0 + 1.80 \times \left(\frac{T_s - \tau_s}{T_s}\right)^2$$
+Quadratic session decay factor modulated by weekly coupling ($\beta_{\text{session}}$):
+$$\Omega_s(\tau_s) = 1.0 + (1.80 \times \beta_{\text{session}}) \times \left(\frac{T_s - \tau_s}{T_s}\right)^2$$
 $$\text{baseSession} = s_{\text{free}} \times \Omega_s(\tau_s)$$
 
-Critical session burn urgency ($U_{\text{burn}, s}$) if active time before sleep/expiry is $\le 1.5\text{h}$:
+Critical session burn urgency ($U_{\text{burn}, s}$) if active time before sleep/expiry is $\le 1.5\text{h}$, scaled by weekly pacing and session rush weight:
 $$U_{\text{burn}, s} = \begin{cases}
-50.0 \times \left(\frac{s_{\text{free}}}{100.0}\right) \times \left(\frac{1.50 - H_s}{1.50}\right) & \text{if } H_s \le 1.50\text{h} \text{ and } s_{\text{free}} \ge 15.0\% \\
+50.0 \times \beta_{\text{session}} \times \left(\frac{s_{\text{free}}}{100.0}\right) \times \left(\frac{1.50 - H_s}{1.50}\right) \times W_{\text{weekly}} & \text{if } H_s \le 1.50\text{h} \text{ and } s_{\text{free}} \ge 15.0\% \\
 0.0 & \text{otherwise}
 \end{cases}$$
 

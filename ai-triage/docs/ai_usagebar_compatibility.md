@@ -8,6 +8,13 @@ Version **1.7.3** adds half-hour availability budgets and credit-expiry scoring
 separate from ordinary weekly urgency, with deadline/capacity regression coverage.
 Version **1.7.4** suppresses false early-renewal notices when rolling 7-day windows
 (such as OpenAI Codex) clear usage or wake up idle at 0% with unanchored `now + 7d` deadlines.
+Version **1.8.4** adds persistent report caching (`last-report.json`) and progressive retry backoff
+(8s–60s) for cold-boot resilience during early desktop startup before network/DNS readiness.
+Version **1.8.5** adds isolated headless command execution shields (`bin/headless/`) and
+browser suppression wrappers, preventing background CLI queries from spawning interactive
+browser OAuth windows during cold startup or network dropouts.
+Version **1.9.0** identifies model-specific reset offers without adding type labels
+to general resets or repeating the model throughout a credit card.
 
 The original audit was checked on 2026-10-23 against the then-current release,
 [v1.43.0](https://github.com/akitaonrails/ai-usagebar/releases/tag/v1.43.0),
@@ -18,6 +25,80 @@ continues to own authentication, provider requests, caching, token renewal and
 rate-limit backoff. The plugin consumes the report without modifying credentials.
 See upstream's [report projection](https://github.com/akitaonrails/ai-usagebar/blob/v1.43.0/src/report.rs)
 and [Antigravity CLI deadlines](https://github.com/akitaonrails/ai-usagebar/blob/v1.43.0/src/antigravity/agy.rs).
+
+## Model-specific reset labels in 1.9.0
+
+Reviewed 2026-11-10 with installed ai-usagebar 1.50.0 and Noctalia 5.4.0.
+
+The Claude report exposes both `Weekly (7d)` and `Fable (7d)` metrics. Its reset
+inventory describes the launch offer as a Fable reset, but does not supply a
+structured scope field. AI Triage recognizes explicit reset/model wording in the
+offer title, including versioned model names, legacy text-only inventories and
+model labels supplied by quota metrics. A model mentioned only as launch context
+does not establish a restricted reset. Unknown titles remain in tooltips.
+
+The credit card shows **Fable reset** once, followed by
+`Weekly: this model only · 5h: all models` when the account reports a session
+limit. Other model-specific offers get a model label and a short scope
+description. General resets get no extra type label or coverage line. All cards
+retain their complete upstream title in the header tooltip. Weekly routing
+badges identify the model as `Fast-track · Fable` or `Claim Fable Reset`;
+standalone advice and tooltips also retain the model context.
+
+[Claude's reset documentation](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)
+states that this offer restores weekly usage spent on Fable while preserving
+usage spent on other models. It also refills the complete five-hour session,
+when present, and keeps the ordinary weekly renewal date.
+[The launch offer](https://support.claude.com/en/articles/17506494-claude-fable-5-2-launch-offers)
+illustrates an 80% week consisting of 50% Fable and 30% other-model usage dropping
+to 30% after redemption. Fable usage still draws from the shared weekly quota;
+its additional limit is not an independent weekly allowance.
+
+The real November 10 report announced ordinary renewal on November 17 at 02:00
+CET and credit expiry at 08:59 CET that morning. Existing last-chance logic
+recognizes that the credit cannot usefully wait for that next cycle. This
+release preserves that logic, quota valuation, scoring and the 95% claim
+threshold. Estimates still use the overall weekly metric, not attributed Fable
+usage; model-specific advice explicitly says `Estimate uses total weekly quota`.
+These estimates do not promise that a Fable reset restores all weekly usage.
+
+Validation: all twelve Lua suites, the Brussels credit-deadline replay and
+`noctalia plugins lint .` pass. Scope regressions cover the actual launch title,
+missing model metrics, custom metric names, legacy inventories, mixed accounts,
+general/unknown offers and the rendered badges/tooltips. The real Hyprland panel
+was inspected at the configured Huge scale. The strict Python catalog check
+still fails on unchanged pre-release code: installed ai-usagebar 1.50.0 adds
+`mistral` beyond the recorded 1.47 catalog. This release does not claim that
+provider's selector support. The community snapshot ships regular copies of the
+headless interceptor scripts to satisfy its no-symlink packaging rule.
+
+## Headless background query isolation and browser suppression in 1.8.5
+
+Reviewed 2026-11-08 with installed ai-usagebar 1.48.2 and Noctalia 5.4.0.
+
+In desktop sessions where Noctalia and AI Triage start quickly (or during transient network / DNS drops), upstream tools attempting to query or refresh provider tokens can behave unexpectedly:
+1. **Background `agy -p /quota` subshell invocation**: Both `ai-usagebar`'s internal Antigravity telemetry provider (`src/antigravity/agy.rs`) and AI Triage's local session telemetry fallback query the Antigravity CLI via `agy -p /quota`.
+2. **Headless OAuth popup pitfall**: When `agy` encounters a network outage, cold-boot unreadiness (e.g. Wi-Fi DHCP pending), or an unvalidated token, its internal Go authentication routine (`server_oauth.go` / `authhandler`) treats the condition as an unauthenticated session and executes `xdg-open` with the Google OAuth consent URL, inadvertently launching a full browser window/tab (`app-com.google.Chrome.scope`) on the user's desktop from an automated background check.
+
+Version 1.8.5 implements comprehensive multi-layer isolation:
+- **Universal headless environment wrapper (`buildHeadlessCommand`)**: Every background command spawned by the service (`ai-usagebar usage --json` and `agy -p /quota`) executes with an isolated `PATH` containing `bin/headless` as its first entry, plus `export BROWSER=: BROWSER_NO_OPEN=1`.
+- **Headless interceptor scripts (`bin/headless/`)**: Dummy executable shims for `xdg-open`, `gio`, `x-www-browser`, `www-browser`, and `default-browser` immediately terminate with exit code 1 when invoked in headless mode, safely neutralizing unwanted browser launches.
+- **Safe `agy` wrapper (`bin/headless/agy`)**: Ensures that any nested execution of `agy` (such as those dispatched internally by `ai-usagebar`) inherits the headless shield and suppresses child browser processes.
+- **Settling grace period**: In addition to serving cached metrics immediately from `last-report.json`, background CLI executions are suppressed for the first 20 seconds of desktop startup, allowing NetworkManager, wireless association, and system secret storage (GNOME Keyring / Secret Service) to settle.
+
+## Fast Boot resilience and persistent report caching in 1.8.4
+
+Reviewed 2026-11-05 with ai-usagebar 1.48.1 and Noctalia 5.4.0.
+
+In desktop environments with fast parallel session startup (such as UWSM with `-g -1`), the graphical shell and AI Triage start before the host network interface and DNS resolver finish establishing connectivity.
+
+When `ai-usagebar usage --json` returns a non-zero exit code due to DNS or network unavailability (e.g. `Could not resolve host`), the service previously scheduled the next attempt using the regular polling interval (3 to 5 minutes), leaving the panel without data.
+
+Version 1.8.4 implements:
+1. **Persistent disk cache**: Successful reports are written atomically to `last-report.json` in the plugin data directory. On startup, the cached report is decoded and loaded into `noctalia.state.get("report")` synchronously (0 ms), ensuring bar capsules and panels show valid telemetry immediately.
+2. **Progressive network failure retry**: When a refresh fails without an imminent expired credit deadline, the refresh interval switches to progressive retry (`math.min(RETRY_MAX_MS, RETRY_BASE_MS * retryCount)`, 8s, 16s... up to 60s). Successful refreshes, configuration changes, and manual IPC commands reset `retryCount` to 0.
+3. **Panel fast rendering**: `onOpen()` reads cached state and calls `render()` immediately before triggering a refresh request, eliminating startup latency and flickering.
+4. **Loading state**: While polling with zero candidates, the panel displays an informative loading indicator instead of misleadingly claiming no providers are configured.
 
 ## DeepRelay and the 1.47 catalog in 1.8.3
 

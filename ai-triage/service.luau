@@ -7,6 +7,25 @@
 local COMMAND = "ai-usagebar usage --json"
 local shared = require("./shared.luau")
 
+local function getHeadlessDir()
+    local pluginDir = (type(noctalia.pluginDir) == "function" and noctalia.pluginDir())
+        or (noctalia.expandPath and noctalia.expandPath("~/.config/noctalia/plugins/ai-triage"))
+    return pluginDir and (pluginDir .. "/bin/headless") or nil
+end
+
+local function buildHeadlessCommand(cmd, timeoutMs)
+    local headlessDir = getHeadlessDir()
+    local prefix = (headlessDir and type(headlessDir) == "string")
+        and string.format('export PATH="%s:$PATH" BROWSER=: BROWSER_NO_OPEN=1; ', headlessDir)
+        or 'export BROWSER=: BROWSER_NO_OPEN=1; '
+    if timeoutMs then
+        local marker = "__AI_TRIAGE_EXIT__"
+        return prefix .. "timeout --kill-after=5s " .. tostring(math.floor(timeoutMs / 1000))
+            .. "s " .. cmd .. " 2>&1; code=$?; printf '\\n" .. marker .. "%s\\n' \"$code\""
+    end
+    return prefix .. "exec " .. cmd
+end
+
 local function intervalMs()
     local minutes = tonumber(noctalia.getConfig("refresh_minutes")) or 5
     if minutes < 1 then minutes = 1 end
@@ -26,11 +45,10 @@ local function runQuery(callback)
     -- Streams have no host deadline; coreutils timeout bounds the entire CLI
     -- process group, and the final marker reports completion even on failure.
     if type(noctalia.runStream) ~= "function" then
-        return noctalia.runAsync(COMMAND, callback, math.min(timeoutMs, 60000))
+        return noctalia.runAsync(buildHeadlessCommand(COMMAND), callback, math.min(timeoutMs, 60000))
     end
     local marker = "__AI_TRIAGE_EXIT__"
-    local command = "timeout --kill-after=5s " .. tostring(math.floor(timeoutMs / 1000))
-        .. "s " .. COMMAND .. " 2>&1; code=$?; printf '\\n" .. marker .. "%s\\n' \"$code\""
+    local command = buildHeadlessCommand(COMMAND, timeoutMs)
     local document, diagnostics, completed = "", {}, false
     return noctalia.runStream(command, function(line)
         if completed then return end
@@ -200,15 +218,29 @@ end
 
 local inFlight = false
 local pendingRefresh = false
+local retryCount = 0
+local RETRY_BASE_MS = 8000
+local RETRY_MAX_MS = 60000
 
 local weeklyHistory = {}
 local weeklyHistoryPath = nil
 local weeklyDataDir = nil
+local cachedReportPath = nil
 pcall(function()
     weeklyDataDir = noctalia.pluginDataDir()
     weeklyHistoryPath = weeklyDataDir .. "/weekly-resets.json"
+    cachedReportPath = weeklyDataDir .. "/last-report.json"
     local saved = noctalia.json.decode(noctalia.readFile(weeklyHistoryPath) or "")
     if type(saved) == "table" and saved.version == 1 then weeklyHistory = saved end
+
+    local rawReport = noctalia.readFile(cachedReportPath)
+    if type(rawReport) == "string" and rawReport ~= "" then
+        local savedReport = noctalia.json.decode(rawReport)
+        if type(savedReport) == "table" and savedReport.version == 1
+            and type(savedReport.report) == "table" and type(savedReport.report.entries) == "table" then
+            noctalia.state.set("report", savedReport.report)
+        end
+    end
 end)
 
 local function historyLog(message)
@@ -296,6 +328,31 @@ local function scheduleNextRefresh(report)
     noctalia.setUpdateInterval(delay)
 end
 
+local function scheduleFailureRetry(report)
+    local reportDelay = nil
+    if type(report) == "table" and type(report.entries) == "table" then
+        local now = os.time()
+        for _, entry in ipairs(report.entries) do
+            for _, metric in ipairs(type(entry) == "table" and type(entry.metrics) == "table" and entry.metrics or {}) do
+                local _, weekly = shared.dualMetrics({ metric })
+                local at = weekly and shared.parseIso(weekly.reset_at)
+                if at and at <= now then
+                    reportDelay = 60000
+                    break
+                end
+            end
+            if reportDelay then break end
+        end
+    end
+    if reportDelay then
+        noctalia.setUpdateInterval(reportDelay)
+    else
+        retryCount = retryCount + 1
+        local delayMs = math.min(RETRY_MAX_MS, RETRY_BASE_MS * retryCount)
+        noctalia.setUpdateInterval(delayMs)
+    end
+end
+
 -- A floor between spawns. Opening the panel asks for a read, and a panel opens as
 -- fast as a pointer can click.
 local MIN_GAP_MS = 2000
@@ -330,6 +387,7 @@ end
 
 local lastAgyCliAt = 0
 local cachedAgyCliQuota = nil
+local pluginStartedAt = os.time()
 
 local function resolveAgyQuota(callback)
     -- 1. Try reading the observation JSON file first (instant, 0ms)
@@ -370,8 +428,16 @@ local function resolveAgyQuota(callback)
         end
     end
 
-    -- Check if we have cached CLI quota from a recent authoritative query
     local now = os.time()
+
+    -- During early boot/login (first 20 seconds), avoid spawning background CLIs:
+    -- NetworkManager (DHCP/WiFi) and Secret Service/keyrings are still settling.
+    if (now - pluginStartedAt) < 20 then
+        callback(observationQuota)
+        return
+    end
+
+    -- Check if we have cached CLI quota from a recent authoritative query
     if cachedAgyCliQuota and cachedAgyCliQuota.gemini_5h and cachedAgyCliQuota.gemini_5h.reset_at then
         local at = shared.parseIso(cachedAgyCliQuota.gemini_5h.reset_at)
         if at and at > now and (now - lastAgyCliAt) < 180 then
@@ -383,9 +449,12 @@ local function resolveAgyQuota(callback)
     -- 2. Fallback: run `agy -p /quota` asynchronously if `agy` is available.
     -- This performs the exact same force-refresh as typing `/usage` in the terminal.
     -- Throttled to at most once every 30 seconds to avoid spawning unnecessary processes.
+    -- Prepend bin/headless to PATH so background CLI queries never spawn interactive
+    -- browser windows if credentials need a refresh while headless.
     if noctalia and noctalia.runAsync and (now - lastAgyCliAt) >= 30 then
         lastAgyCliAt = now
-        local spawned = noctalia.runAsync("agy -p /quota", function(result)
+        local cmd = buildHeadlessCommand("agy -p /quota")
+        local spawned = noctalia.runAsync(cmd, function(result)
             if result and not result.timedOut and result.exitCode == 0 and result.stdout then
                 local quota = shared.parseAgyCliQuota(result.stdout)
                 if quota then
@@ -496,7 +565,13 @@ local function refresh()
             keepAntigravityReading(safeReport)
             enrichAntigravity(safeReport, function(finalReport)
                 trackWeeklyResets(finalReport)
+                if cachedReportPath then
+                    pcall(function()
+                        writeHistoryFile(cachedReportPath, noctalia.json.encode({ version = 1, report = finalReport }))
+                    end)
+                end
                 inFlight = false
+                retryCount = 0
                 noctalia.state.set("polling", false)
                 noctalia.state.set("report", finalReport)
                 noctalia.state.set("error", failure(""))
@@ -508,7 +583,7 @@ local function refresh()
             inFlight = false
             noctalia.state.set("polling", false)
             noctalia.state.set("error", classify(result))
-            scheduleNextRefresh(noctalia.state.get("report"))
+            scheduleFailureRetry(noctalia.state.get("report"))
         end
 
         if pendingRefresh then refresh() end
@@ -522,12 +597,15 @@ local function refresh()
         noctalia.state.set("refresh_queued", false)
         noctalia.state.set("polling", false)
         noctalia.state.set("error", failure("spawn_failed"))
-        scheduleNextRefresh(noctalia.state.get("report"))
+        scheduleFailureRetry(noctalia.state.get("report"))
     end
 end
 
 noctalia.state.watch("command", function(value)
-    if type(value) == "table" and value.action == "refresh" then refresh() end
+    if type(value) == "table" and value.action == "refresh" then
+        retryCount = 0
+        refresh()
+    end
 end)
 
 function update()
@@ -537,12 +615,16 @@ function update()
 end
 
 function onConfigChanged()
+    retryCount = 0
     noctalia.setUpdateInterval(intervalMs())
     refresh()
 end
 
 function onIpc(event, payload)
-    if event == "refresh" then refresh() end
+    if event == "refresh" then
+        retryCount = 0
+        refresh()
+    end
     -- `select <provider-id>` points the panel at one provider from a script.
     if event == "select" and type(payload) == "string" and payload ~= "" then
         noctalia.state.set("selected", payload)
@@ -556,6 +638,11 @@ function onIpc(event, payload)
         st[payload] = os.time()
         noctalia.state.set("kickstarted_at", st)
     end
+end
+
+-- Compatibility with callers using onMessage
+function onMessage(action, payload)
+    onIpc(action, payload)
 end
 
 -- Clean up legacy cycle memory file from v1.6.0 if present

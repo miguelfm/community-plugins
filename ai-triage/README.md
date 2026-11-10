@@ -6,6 +6,32 @@ AI Triage is an intelligent AI quota monitoring, smart routing, and rolling sess
 
 Built on top of the telemetry engine provided by [ai-usagebar](https://github.com/akitaonrails/ai-usagebar), AI Triage elevates basic quota numbers into actionable routing decisions, real-time pace analysis, and automated session priming.
 
+**Version 1.9.0 makes reset-credit scope visible.**
+Reset cards identify model-specific offers such as **Fable reset**, with
+`Weekly: this model only · 5h: all models` for Claude accounts with a session limit.
+The card names the model once; its description and advice avoid repeating it.
+General resets have no additional type labels; complete source titles remain in
+tooltips, including unrecognized offers. Fast-track and claim badges also name
+the model. Scope is inferred from explicit reset/model wording in the CLI's title, including legacy reports and
+model names supplied by quota metrics. Pacing and refill estimates still use the
+overall weekly quota, and model-specific advice explicitly identifies that limit.
+This release changes presentation, not the credit valuation or claim threshold.
+See the [scope behavior, limits and validation](docs/ai_usagebar_compatibility.md#model-specific-reset-labels-in-190).
+See [Claude's reset documentation](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)
+for the distinction between restoring Fable usage and restoring all weekly usage.
+
+**Version 1.8.5 adds Headless Browser Shielding and Graduated 72h Harvesting.**
+- **Headless background query isolation**: Transparently wraps `ai-usagebar usage --json` and fallback `agy -p /quota` executions with a headless sandbox (`bin/headless/` interceptors for `xdg-open`, `gio`, `x-www-browser`, `default-browser`, and an `agy` wrapper). Prevents transient network disconnects, cold boot unreadiness, or expired sessions from triggering interactive browser OAuth login popups on the desktop.
+- **Two-stage weekly sprint with gearing-aware harvesting (up to 72h)**: Replaces the binary 24h sprint with a continuous two-stage urgency curve. High-gearing models (e.g. Gemini with $K_m = 8$) begin graduating harvest urgency up to 72 hours (3 days) before weekly reset with relaxed pace smoothing (up to 12% over-pace tolerance), preventing cognitive and token bottlenecks. Low-gearing models ($K_m \le 3.5$) maintain protected 48h windows to safeguard early-week capacity.
+- **Cold boot settling grace period**: Introduces a 20-second startup grace period after desktop login before background CLI queries are dispatched, giving NetworkManager, Wi-Fi, and Secret Service/keyrings ample time to initialize while serving immediate UI metrics from the persistent disk cache.
+See the [compatibility audit](docs/ai_usagebar_compatibility.md#headless-background-query-isolation-and-browser-suppression-in-185) and [mathematical model](docs/mathematical_model.md#124-dynamic-urgency-additives).
+
+**Version 1.8.4 adds Fast Boot resilience and persistent report caching.**
+- **Instant startup via cached report**: Persists the last authoritative report in `last-report.json`, allowing the dashboard panel and bar capsules to populate immediately upon system startup without waiting for cold CLI network queries.
+- **Fast Boot retry progression**: Automatically retries failed initial queries progressively (8s, 16s... up to 60s) when the desktop shell starts in parallel before network/DNS connectivity is established, avoiding multi-minute delays until the next periodic refresh.
+- **Loading state**: Displays an informative loading indicator when polling without candidates instead of "No providers configured or reachable."
+See the [Fast Boot audit](docs/ai_usagebar_compatibility.md#fast-boot-resilience-and-persistent-report-caching-in-184) and [Noctalia 5.4 integration](docs/noctalia-5.4.md#fast-boot-and-cold-start-report-persistence-in-184).
+
 **Version 1.8.3 adds DeepRelay and validates ai-usagebar 1.47 compatibility.**
 All 32 ai-usagebar 1.47 providers have translated selector labels, glyphs and
 dashboard links. DeepRelay uses the existing quota-report contract; panel geometry
@@ -22,7 +48,7 @@ dashboard links. Droid uses the existing quota-report contract; panel geometry
 is unchanged. See the [compatibility audit](docs/ai_usagebar_compatibility.md#factory-droid-and-the-144-catalog-in-181).
 
 **Version 1.8.0 adapts to Noctalia 5.4 with calibrated panel geometry and Material 3 palettes.**
-The triage panel adopts `height = "content"` with a calibrated 560px maximum height,
+The triage panel adopts `height = "content"` with a calibrated 675px maximum height,
 eliminating vertical empty space for typical 1–4 provider configurations while preserving
 independent per-column scrolling for extended lists, alongside updated `surface_container`
 and `outline_variant` token roles.
@@ -88,8 +114,9 @@ with `xdg-open`. Install `xdg-open` alongside `ai-usagebar`.
 > **Antigravity & Gemini Quota Endpoint & Telemetry Reconciliation**: For Google Antigravity to report Gemini quotas (both 5-hour session and 7-day weekly limits), `ai-usagebar` must query the production Cloud Code endpoint (`https://cloudcode-pa.googleapis.com`). Because Google's individual Cloud Code API fallback often returns synthetic 0% utilization for Gemini CLI sessions, AI Triage transparently reconciles Antigravity readings with the active local session telemetry (`agy-statusline` observation / `agy -p /quota`), accurately reflecting real 5-hour rolling session progress, true reset deadlines, and weekly utilization.
 
 The plugin requires Noctalia 5.4 or newer (plugin API 43) for the current color
-roles and content-sized panel. The panel fits shorter reports and empty/error
-states, up to 560 logical pixels; longer columns scroll independently.
+roles and content-sized panel. The panel adapts its height automatically to content
+up to 675 logical pixels, fitting standard multi-model setups without vertical scrollbars
+or dead space; longer columns scroll independently if exceeding this ceiling.
 
 For the interactive rolling session kickstart feature (`[⚡ Start 5h]`), the plugin bundles
 `bin/ai-kickstart` and resolves it automatically via `noctalia.pluginDir()`, with fallback to
@@ -106,10 +133,10 @@ Install the respective CLI on `PATH` for any backend provider you wish to prime.
 - **Rounded Session Estimates**: The panel displays estimated sessions as whole numbers for every provider. Calculations and automatic calibration retain the underlying decimal precision.
 - **Multi-Provider & Antigravity Model Separation**: Full independent tracking for all supported providers, including dedicated cards and individual triage scoring for Antigravity's **Gemini** (Gemini 2.5 Pro / Flash) and **Claude & GPT OSS** (Claude 3.7 Sonnet, GPT-OSS) tiers.
 - **Antigravity Local Session Telemetry Reconciliation**: Seamlessly bridges the gap between remote Cloud Code API defaults and active CLI sessions. When remote endpoints emit synthetic idle readings (0% utilization with floating 5h timers awaiting kickstart), the poller automatically enriches Antigravity metrics using local `agy` session status (from `agy-statusline` observation or `agy -p /quota`). This ensures active 5h rolling sessions are immediately detected, countdown timers reflect authentic reset moments, and triage burn urgency is calculated with precision.
-- **Mathematical Triage & Prioritization Engine**: Dynamically ranks providers using a continuous optimization model that balances 5-hour rolling session exhaustion against 7-day weekly pace. Prioritizes under-utilized quotas, boosts providers with upcoming weekly resets ($\le 48\text{h}$) to avoid wasting expiring allocations, and enforces hard lockouts for exhausted quotas.
+- **Mathematical Triage & Prioritization Engine**: Dynamically ranks providers using a continuous optimization model that balances 5-hour rolling session exhaustion against 7-day weekly pace. Implements a Graduated Multi-Stage Weekly Sprint (gearing-aware harvesting opening up to 72h / 3 days for high-throughput models like Gemini to eliminate human cognitive bottlenecks, with relaxed pace tolerance during pre-sprint, followed by critical sprint in the last 24 hours), couples 5h session rush urgency with weekly remaining horizon and quota headroom (damping session panic when an entire week remains with low consumption, while accelerating burn when weekly reset approaches or session slots are scarce), and enforces hard lockouts for exhausted quotas.
 - **Interactive Session Priming (`ai-kickstart`)**: Providers with rolling windows (Claude, Codex, Antigravity) start their countdown when the first prompt is sent. The panel displays a `[⚡ Start 5h]` button to prime sessions at the start of your workday with a single click. Priming automatically persists in Noctalia state, immediately unlocks the active expiration clock (rather than an unstarted `--:--` placeholder), and is automatically suppressed for providers whose weekly quotas are already depleted.
 - **Robust Rolling Window Detection**: Real-time detection of active rolling session clocks across all supported providers, ensuring countdowns and needle markers begin immediately upon usage.
-- **Temporal Distribution & Anti-Burst Smoothing**: Prevents rapid quota concentration followed by availability droughts ("baleiros") by monitoring deviation from nominal weekly burn pace ($\Delta_{\text{pace}}$). Smoothly modulates priority early and mid-cycle to maintain continuous multi-service availability throughout the working week, while releasing all damping for the final sprint in the last 24 active hours.
+- **Temporal Distribution & Anti-Burst Smoothing**: Prevents rapid quota concentration followed by availability droughts ("baleiros") by monitoring deviation from nominal weekly burn pace ($\Delta_{\text{pace}}$). Smoothly modulates priority early and mid-cycle to maintain continuous multi-service availability throughout the working week, relaxes pace tolerance ($\text{paceTol} \le 12\%$) across the 48–72h harvesting window, and releases all damping for the critical final sprint in the last 24 hours.
 - **Parallel Coordinated Session & Weekly Ranking**: Keeps Column 1 (5h Session) and Column 2 (7d Weekly) strictly synchronized row-by-row for unified per-service routing decisions based on comprehensive 5h, 7d, gearing, and reset credit factors.
 - **Weekly Cycles Schedule & Imminent Renewal Alerts (Column 3)**: Disambiguates automatic 7-day natural renewal cycles from promotional on-demand reset credits. Column 3 features a dedicated schedule card with strictly aligned tabular layout: countdowns display days and hours (`Xd Yh`) with matching vertical alignment for both `d` and `h` units, followed by the exact reset day and clock time (`HH:MM`) with vertically aligned `:` separators across all rows. High-visibility alert cards appear whenever a weekly quota is expiring within $\le 48\text{h}$ with unused headroom.
 - **Dynamic Upstream Weekly Horizon Alignment**: Accurately tracks rolling and anchor-based 7-day rate limit schedules across manual quota resets and promotional reset credits (e.g. Codex/OpenAI Banked Resets and Instant Resets). When an extra reset pulls the weekly allocation forward, the engine immediately synchronizes to the authentic upstream 7-day horizon, eliminating false sprint panics and ensuring mathematically optimal triage pacing and reliable countdowns.
@@ -119,7 +146,7 @@ Install the respective CLI on `PATH` for any backend provider you wish to prime.
 - **Service & Model Visibility Filtering**: Allows hiding specific sub-models or third-party tiers (such as Antigravity's "Claude & GPT OSS") via `hide_claude_oss` or `hidden_services` while retaining full visibility, pacing, and telemetry for other tiers like Gemini, Codex, or Claude Pro across both the status bar capsule and the triage panel. Hidden exhausted tiers are excluded from blocking warnings. When a pinned bar capsule targets a hidden tier or service, the capsule dynamically collapses (`barWidget.setVisible(false)`), reclaiming taskbar space without leaving empty gaps or fallback glyphs.
 - **Provider Identity & Outage Resilience**: Transient outages (such as upstream HTTP 429 Rate Limits or connectivity interruptions) preserve the provider's recognizable icon and identity in error tint rather than falling back to an ambiguous scale icon, presenting actionable diagnostic tooltips on the bar and maintaining dedicated diagnostic cards within the triage panel.
 - **Actionable Failure Diagnostics**: Failed providers stay visible in the panel with the cause, recommended action and original CLI detail. Missing or rejected Claude credentials show `claude auth login` and a copy button; rate limits, server outages, permissions, network failures and response format errors have separate guidance. Automatic bar tooltips retain these diagnostics alongside working providers, and successful refreshes clear them.
-- **Adaptive Geometry & Native Scrolling**: Content-sized panel with a 560px maximum and per-column native scrolling (`ui.scroll`) for model cards, renewal timelines, and reset credits across typography presets (including Huge / 130%).
+- **Adaptive Geometry & Native Scrolling**: Content-sized panel with a calibrated 675px maximum and per-column native scrolling (`ui.scroll`) for model cards, renewal timelines, and reset credits across typography presets (including Huge / 130%), fitting without scrollbars or vertical empty space under typical configurations.
 
 ## Usage
 
