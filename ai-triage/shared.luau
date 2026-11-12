@@ -243,7 +243,7 @@ function M.diagnostic(entry)
         code = "signed_out"
     elseif status == 401 or M.terminalAuth(entry)
         or has("authentication rejected", "invalid_grant", "token expired", "token has expired",
-            "invalid api key", "api key is invalid", "unauthorized") then
+            "invalid api key", "api key is invalid", "unauthorized", "authentication required", "enrollment required") then
         code = "authentication"
     elseif status == 403 then
         code = "permission"
@@ -258,7 +258,9 @@ function M.diagnostic(entry)
     local account = tostring(entry and entry.id or ""):match("@(.+)$")
     if code == "signed_out" or code == "authentication" then
         local provider = M.baseProvider(entry and entry.id)
-        if account then
+        if entry.collector_backend == "shuvquota" then
+            action = "shuvquota"
+        elseif account then
             action = "named_account"
         elseif provider == "anthropic" then
             action, command = "login", "claude auth login"
@@ -278,6 +280,7 @@ function M.diagnostic(entry)
             action = "reconnect"
         end
     end
+    if entry.collector_backend == "shuvquota" and code == "schema" then action = "collector_schema" end
     return { code = code, titleKey = "ui.diagnostic.cause." .. code,
         actionKey = "ui.diagnostic.action." .. action, actionArgs = { account = account or "" },
         command = command, detail = detail, retryable = code ~= "rate_limited" }
@@ -523,18 +526,32 @@ function M.isQuotaMetric(metric)
     return type(metric) == "table" and trim(tostring(metric.group or "")) == ""
 end
 
+-- Fable's extra limit is model-specific, even when the collector leaves it
+-- ungrouped. Keep it in the raw report for the optional detail, but never let
+-- it stand in for Claude's shared session/weekly quota or exhaust the account.
+function M.providerMetrics(entry)
+    local metrics = {}
+    for _, metric in ipairs(type(entry) == "table" and type(entry.metrics) == "table" and entry.metrics or {}) do
+        if M.isQuotaMetric(metric) and not (M.baseProvider(entry.id) == "anthropic"
+            and tostring(metric.label or ""):lower():find("%f[%w]fable%f[%W]")) then
+            metrics[#metrics + 1] = metric
+        end
+    end
+    return metrics
+end
+
 function M.metricText(metric)
     if type(metric) ~= "table" then return nil end
     if metric.headline == "value" and trim(tostring(metric.value or "")) ~= "" then
         return tostring(metric.value)
     end
     local percent = tonumber(metric.percent)
-    return percent and string.format("%d%%", percent) or tostring(metric.value or "")
+    return percent and string.format("%.0f%%", percent) or tostring(metric.value or "")
 end
 
 function M.headline(entry)
     if type(entry) ~= "table" or type(entry.metrics) ~= "table" then return nil end
-    local metrics = entry.metrics
+    local metrics = M.providerMetrics(entry)
     if #metrics == 0 then return nil end
 
     local visibleMetrics = {}
@@ -792,7 +809,7 @@ function M.enrichAntigravityEntry(entry, quotaData)
         if not qd then return end
         if qd.percent ~= nil then
             m.percent = qd.percent
-            m.value = string.format("%d%%", qd.percent)
+            m.value = string.format("%.0f%%", qd.percent)
             if qd.percent >= 90 then
                 m.severity = "critical"
             elseif qd.percent >= 75 then
@@ -859,7 +876,7 @@ function M.enrichAntigravityEntry(entry, quotaData)
             percent = pct,
             reset_at = qd.reset_at,
             severity = sev,
-            value = string.format("%d%%", pct),
+            value = string.format("%.0f%%", pct),
             window_secs = windowSecs,
             started = qd.started,
         }
@@ -1083,7 +1100,7 @@ function M.resetCreditScope(title, entry)
             or lower:find(start .. "%s+[%d%.]+%s+reset%f[%W]")
             or lower:find(start .. "[%- ]only%f[%W]")
             or lower:find("%f[%w]reset%s+for%s+" .. pattern .. "%f[%W]") then
-            local session = M.dualMetrics(entry and entry.metrics)
+            local session = M.dualMetrics(M.providerMetrics(entry))
             return { model = model, label = model .. " reset",
                 detail = M.baseProvider(entry and entry.id) == "anthropic" and model:lower() == "fable"
                     and ("Weekly: this model only" .. (session and " · 5h: all models" or ""))
@@ -1202,32 +1219,32 @@ local function adviseResetCredit(stats, gearing, nowTime, config)
     if worthIt and (spent or canClaimPeril or (expiryFirst and expiryHours <= 2.0)) then
         advice.status = "claim"
         advice.summary = spent
-            and string.format("Weekly quota spent · claim now: ~%d%% of a week back before the renewal in %s",
+            and string.format("Weekly quota spent · claim now: ~%.0f%% of a week back before the renewal in %s",
                 math.floor(nowGain + 0.5), renewIn)
-            or string.format("Reset credit expires in %s · claim now: ~%d%% of a week back",
+            or string.format("Reset credit expires in %s · claim now: ~%.0f%% of a week back",
                 expiresIn, math.floor(nowGain + 0.5))
     elseif worthIt then
         advice.status = "advance"
         if expiresAt < renewAt then
-            advice.summary = string.format("Claim before %s · burn remaining %d%% early · worth up to ~%d%% of a week",
+            advice.summary = string.format("Claim before %s · burn remaining %.0f%% early · worth up to ~%.0f%% of a week",
                 os.date("%b %d %H:%M %Z", expiresAt),
                 math.floor(math.max(0, M.CLAIM_MIN_WEEKLY_PCT - stats.weeklyPercent) + 0.5), math.floor(cycleGain + 0.5))
         elseif lastChance and (renewAt - nowTime) <= (7 * 86400) and not expiryFirst then
-            advice.summary = string.format("Claim before renewal in %s · burn remaining %d%% early · worth ~%d%% of a week",
+            advice.summary = string.format("Claim before renewal in %s · burn remaining %.0f%% early · worth ~%.0f%% of a week",
                 renewIn, math.floor(wFree + 0.5), math.floor(cycleGain + 0.5))
         elseif expiryFirst then
-            advice.summary = string.format("Claim before the credit expires in %s · worth ~%d%% of a week",
+            advice.summary = string.format("Claim before the credit expires in %s · worth ~%.0f%% of a week",
                 expiresIn, math.floor(cycleGain + 0.5))
         else
-            advice.summary = string.format("Claim once this week runs out · worth ~%d%% of a week",
+            advice.summary = string.format("Claim once this week runs out · worth ~%.0f%% of a week",
                 math.floor(cycleGain + 0.5))
         end
     else
         advice.status = "hold"
         advice.summary = laterGain > cycleGain
-            and string.format("Keep the reset: renews in %s, a claim now adds ~%d%% of a week vs ~%d%% next cycle",
+            and string.format("Keep the reset: renews in %s, a claim now adds ~%.0f%% of a week vs ~%.0f%% next cycle",
                 renewIn, math.floor(cycleGain + 0.5), math.floor(laterGain + 0.5))
-            or string.format("Keep the reset: a claim this cycle adds only ~%d%% of a week",
+            or string.format("Keep the reset: a claim this cycle adds only ~%.0f%% of a week",
                 math.floor(cycleGain + 0.5))
     end
     return advice
@@ -1303,7 +1320,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
         local availableCount = type(entry.reset_credits) == "table" and tonumber(entry.reset_credits.available) or 0
         local sections = type(entry.sections) == "table" and entry.sections or {}
 
-        local _, wMetric = M.dualMetrics(entry.metrics)
+        local _, wMetric = M.dualMetrics(M.providerMetrics(entry))
         local wPct = wMetric and tonumber(wMetric.percent) or 0
         local wWindow = wMetric and tonumber(wMetric.window_secs) or 604800
         local wAt = wMetric and M.parseIso(wMetric.reset_at)
@@ -1314,7 +1331,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
         if type(rawCredits) == "table" and #rawCredits > 0 and availableCount ~= 0 then
             for _, rc in ipairs(rawCredits) do
                 local expAt = M.parseIso(rc.expires_at)
-                if expAt and expAt > nowTime then
+                if expAt and expAt > nowTime and rc.weekly ~= false then
                     list[#list + 1] = {
                         title = rc.title or "Full reset",
                         expiresAt = expAt,
@@ -1369,7 +1386,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
                 weeklyRemainingSecs = wRemainingSecs,
                 entry = entry,
             }
-            stats.advice = adviseResetCredit(stats, M.getModelGearing(id, displayName), nowTime, scheduleConfig)
+            stats.advice = adviseResetCredit(stats, M.getModelGearing(id, displayName, { entry = entry }), nowTime, scheduleConfig)
             stats.advice.scope = earliest and earliest.scope
             stats.canClaimNow = stats.advice.status == "claim"
             providerStats[id] = stats
@@ -1457,7 +1474,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
                 -- The deferred credit waits for a later cycle while that one can still pay it back.
                 if deferP.advice.status == "advance" and not deferP.advice.lastChance then
                     deferP.advice.status = "hold"
-                    deferP.advice.summary = string.format("Deferred: keep it for the cycle after the renewal in %s · worth ~%d%% of a week",
+                    deferP.advice.summary = string.format("Deferred: keep it for the cycle after the renewal in %s · worth ~%.0f%% of a week",
                         formatDuration(deferP.weeklyRemainingSecs), math.floor(deferP.advice.laterGain + 0.5))
                 end
                 break
@@ -1469,7 +1486,7 @@ function M.analyzeResetCredits(entries, nowTime, scheduleConfig)
         stats.advice.cardSummary = M.resetCreditScopeSummary(stats.advice, stats.advice.summary, false)
         stats.advice.summary = M.resetCreditScopeSummary(stats.advice, stats.advice.summary)
         if staggerPlan.fastTrack[id] then
-            local session, weekly = M.dualMetrics(stats.entry.metrics)
+            local session, weekly = M.dualMetrics(M.providerMetrics(stats.entry))
             stats.advice.urgency = M.resetCreditUrgency({ entry = stats.entry, providerId = id,
                 name = stats.name, sessionMetric = session, weeklyMetric = weekly },
                 stats.advice, nowTime, scheduleConfig, true)
@@ -1582,7 +1599,7 @@ function M.collectModelItems(candidates)
                     }
                 end
             elseif not M.isModelHidden(id, displayName) then
-                local sMetric, wMetric = M.dualMetrics(entry.metrics)
+                local sMetric, wMetric = M.dualMetrics(M.providerMetrics(entry))
                 items[#items + 1] = {
                     providerId = id,
                     providerName = displayName,
@@ -1598,7 +1615,7 @@ function M.collectModelItems(candidates)
             end
         else
             if not M.isModelHidden(id, displayName) then
-                local sMetric, wMetric = M.dualMetrics(entry.metrics)
+                local sMetric, wMetric = M.dualMetrics(M.providerMetrics(entry))
                 items[#items + 1] = {
                     providerId = id,
                     providerName = displayName,
@@ -1657,7 +1674,9 @@ function M.collectResetCredits(candidates, staggerPlan)
                     add(rc.title, at, at and os.date("%b %d %H:%M", at) or nil)
                 end
                 if #list == 0 and (tonumber(inventory.available) or 0) > 0 then
-                    add(tostring(inventory.available) .. " reset credits")
+                    local nextAt = inventory.partial == true and M.parseIso(inventory.next_expires_at) or nil
+                    add(tostring(inventory.available) .. " reset credits" .. (nextAt and " · next expiry" or ""),
+                        nextAt, nextAt and os.date("%b %d %H:%M", nextAt) or nil)
                 end
             end
         else
@@ -1874,6 +1893,11 @@ M.DEFAULT_GEARING = {
 -- In-memory empirical telemetry store for tracking session delta vs weekly delta (K_obs = Delta S / Delta W)
 M.telemetryBaselines = {}
 
+local function collectorTelemetryKey(key, item)
+    local scope = item and item.entry and item.entry.collector_scope
+    return scope and scope ~= "ai-usagebar" and (key .. "/" .. scope) or key
+end
+
 function M.modelTelemetryKey(providerId, modelName)
     local pid = tostring(providerId or ""):lower()
     local mname = tostring(modelName or ""):lower()
@@ -1925,7 +1949,7 @@ function M.recordTelemetrySample(item)
     local wPct = tonumber(wMetric.percent)
     if sPct == nil or wPct == nil then return end
 
-    local key = M.modelTelemetryKey(item.providerId or (item.entry and item.entry.id), item.name)
+    local key = collectorTelemetryKey(M.modelTelemetryKey(item.providerId or (item.entry and item.entry.id), item.name), item)
     local sReset = tostring(sMetric.reset_at or "")
     local wReset = tostring(wMetric.reset_at or "")
     local isStraddling = M.isSessionStraddlingWeeklyReset(item)
@@ -2029,7 +2053,7 @@ function M.getModelGearing(providerId, modelName, item)
             local st = noctalia.state.get("gearing_telemetry")
             if type(st) == "table" then telemetry = st end
         end
-        local rec = telemetry and telemetry[key]
+        local rec = telemetry and telemetry[collectorTelemetryKey(key, item)]
         if rec and rec.k_calibrated and rec.k_calibrated > 0 and not rec.straddling_reset then
             return rec.k_calibrated, true
         end
